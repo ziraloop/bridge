@@ -37,11 +37,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/bin"
-          VERSION=$(curl -fsSL --retry 3 --retry-delay 5 https://codedb.codegraff.com/latest.json | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
-          echo "Installing codedb v${VERSION}"
-          curl -fsSL --retry 3 --retry-delay 5 "https://codedb.codegraff.com/v${VERSION}/codedb-linux-x86_64" -o "$HOME/bin/codedb"
+          gh release download --repo justrach/codedb --pattern "codedb-linux-x86_64" --dir "$HOME/bin"
           chmod +x "$HOME/bin/codedb"
         env:
+          GH_TOKEN: ${{ github.token }}
           CODEDB_NO_TELEMETRY: "1"
       - name: verify codedb
         shell: bash
