@@ -1,5 +1,8 @@
+use std::sync::OnceLock;
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use regex::Regex;
 
 /// Central error type for the bridge runtime.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +67,46 @@ pub enum BridgeError {
 /// Convenience Result type alias for bridge operations.
 pub type Result<T> = std::result::Result<T, BridgeError>;
 
+/// Cap on how many bytes of a provider/MCP/tool error we echo to clients.
+const SANITIZE_MAX_BYTES: usize = 512;
+
+fn sk_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"sk-[A-Za-z0-9_\-]+").unwrap())
+}
+
+fn bearer_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"Bearer\s+\S+").unwrap())
+}
+
+fn api_key_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?i)api[_-]?key["']?\s*[:=]\s*["']?\S+"#).unwrap()
+    })
+}
+
+/// Redact common secret patterns and truncate to `SANITIZE_MAX_BYTES`
+/// (UTF-8-safe) before sending error text to API clients.
+fn sanitize_for_response(raw: &str) -> String {
+    let step1 = sk_regex().replace_all(raw, "sk-***");
+    let step2 = bearer_regex().replace_all(&step1, "Bearer ***");
+    let step3 = api_key_regex().replace_all(&step2, "api_key=***");
+    let s: &str = &step3;
+    if s.len() <= SANITIZE_MAX_BYTES {
+        return s.to_string();
+    }
+    let mut end = 0;
+    for (idx, _) in s.char_indices() {
+        if idx > SANITIZE_MAX_BYTES {
+            break;
+        }
+        end = idx;
+    }
+    s[..end].to_string()
+}
+
 impl IntoResponse for BridgeError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
@@ -87,10 +130,26 @@ impl IntoResponse for BridgeError {
             }
         };
 
+        let message = match &self {
+            BridgeError::ProviderError(msg) => {
+                tracing::error!(error = %msg, "provider_error_response");
+                format!("provider error: {}", sanitize_for_response(msg))
+            }
+            BridgeError::McpError(msg) => {
+                tracing::error!(error = %msg, "mcp_error_response");
+                format!("mcp error: {}", sanitize_for_response(msg))
+            }
+            BridgeError::ToolError(msg) => {
+                tracing::error!(error = %msg, "tool_error_response");
+                format!("tool error: {}", sanitize_for_response(msg))
+            }
+            _ => self.to_string(),
+        };
+
         let body = serde_json::json!({
             "error": {
                 "code": code,
-                "message": self.to_string(),
+                "message": message,
             }
         });
 
@@ -164,5 +223,45 @@ mod tests {
         let err = BridgeError::CapacityExhausted("max conversations".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_sanitize_redacts_sk_tokens() {
+        let out = sanitize_for_response("leaked sk-1234ABCD_efgh-zzz in the log");
+        assert!(!out.contains("sk-1234"));
+        assert!(out.contains("sk-***"));
+    }
+
+    #[test]
+    fn test_sanitize_redacts_bearer_tokens() {
+        let out = sanitize_for_response("Authorization: Bearer abcdef.ghijkl");
+        assert!(!out.contains("abcdef"));
+        assert!(out.contains("Bearer ***"));
+    }
+
+    #[test]
+    fn test_sanitize_redacts_api_key_assignments() {
+        let out = sanitize_for_response("config api_key=\"supersecret\" done");
+        assert!(!out.contains("supersecret"));
+        assert!(out.contains("api_key=***"));
+
+        let out2 = sanitize_for_response("config Api-Key: superSecret done");
+        assert!(!out2.contains("superSecret"));
+        assert!(out2.contains("api_key=***"));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_to_512_bytes_utf8_safe() {
+        let giant = "é".repeat(1000);
+        let out = sanitize_for_response(&giant);
+        assert!(out.len() <= SANITIZE_MAX_BYTES);
+        // Ensures no half-char slicing
+        assert!(out.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn test_sanitize_short_string_passes_through() {
+        let out = sanitize_for_response("simple error");
+        assert_eq!(out, "simple error");
     }
 }

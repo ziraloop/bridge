@@ -134,6 +134,85 @@ macro_rules! dispatch_prompt_simple {
     }};
 }
 
+/// Retry a provider call with exponential backoff.
+///
+/// Sole site of the `INITIAL_BACKOFF` / `MAX_BACKOFF` / `BACKOFF_FACTOR` /
+/// `MAX_RETRIES` loop shape. Call sites supply the dispatch expression and
+/// per-attempt log blocks; everything else (backoff math, retry predicate,
+/// attempt count, error bubbling) lives here and only here.
+macro_rules! retry_with_backoff {
+    (
+        success_ty = $ok_ty:ty,
+        on_backoff = |$bk_attempt:ident, $bk_backoff:ident, $bk_last_err:ident| $on_backoff:block,
+        on_start = |$st_attempt:ident| $on_start:block,
+        dispatch = |$disp_attempt:ident| $dispatch:expr,
+        on_success = |$sc_ok:ident, $sc_attempt:ident, $sc_latency_ms:ident| $on_success:block,
+        on_retry = |$rt_err:ident, $rt_attempt:ident, $rt_latency_ms:ident| $on_retry:block,
+        on_fail = |$fl_err:ident, $fl_attempt:ident, $fl_latency_ms:ident| $on_fail:block $(,)?
+    ) => {{
+        let mut last_error: Option<PromptError> = None;
+        let mut backoff: Duration = INITIAL_BACKOFF;
+        let mut attempt: usize = 0;
+        let final_result: Result<$ok_ty, PromptError> = loop {
+            if attempt > 0 {
+                {
+                    let $bk_attempt = attempt;
+                    let $bk_backoff = backoff;
+                    let $bk_last_err = last_error.as_ref().unwrap();
+                    $on_backoff
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = Duration::from_secs_f64(
+                    (backoff.as_secs_f64() * BACKOFF_FACTOR).min(MAX_BACKOFF.as_secs_f64()),
+                );
+            }
+            {
+                let $st_attempt = attempt;
+                $on_start
+            }
+            let start = std::time::Instant::now();
+            let result: Result<$ok_ty, PromptError> = {
+                let $disp_attempt = attempt;
+                let _ = &$disp_attempt;
+                $dispatch
+            };
+            let latency_ms = start.elapsed().as_millis() as u64;
+            match result {
+                Ok(ok) => {
+                    {
+                        let $sc_ok = &ok;
+                        let $sc_attempt = attempt;
+                        let $sc_latency_ms = latency_ms;
+                        $on_success
+                    }
+                    break Ok(ok);
+                }
+                Err(e) => {
+                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
+                        {
+                            let $rt_err = &e;
+                            let $rt_attempt = attempt;
+                            let $rt_latency_ms = latency_ms;
+                            $on_retry
+                        }
+                        last_error = Some(e);
+                        attempt += 1;
+                        continue;
+                    }
+                    {
+                        let $fl_err = &e;
+                        let $fl_attempt = attempt;
+                        let $fl_latency_ms = latency_ms;
+                        $on_fail
+                    }
+                    break Err(e);
+                }
+            }
+        };
+        final_result
+    }};
+}
+
 /// Dispatch a streaming prompt across a concrete agent variant, mapping
 /// the provider-specific `MultiTurnStreamItem<R>` into `BridgeStreamItem`.
 ///
@@ -232,11 +311,9 @@ impl BridgeAgent {
         let agent_id = hook.agent_id.clone();
         let conversation_id = hook.conversation_id.clone();
 
-        let mut last_error: Option<PromptError> = None;
-        let mut backoff = INITIAL_BACKOFF;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
+        retry_with_backoff! {
+            success_ty = PromptResponse,
+            on_backoff = |attempt, backoff, last_err| {
                 warn!(
                     agent_id = %agent_id,
                     conversation_id = %conversation_id,
@@ -244,83 +321,70 @@ impl BridgeAgent {
                     attempt = attempt,
                     max_retries = MAX_RETRIES,
                     backoff_ms = backoff.as_millis() as u64,
-                    error = %last_error.as_ref().unwrap(),
+                    error = %last_err,
                     "llm_request_retry"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * BACKOFF_FACTOR).min(MAX_BACKOFF.as_secs_f64()),
+            },
+            on_start = |attempt| {
+                info!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    prefix_hash = %self.prefix_hash(),
+                    history_len = history.len(),
+                    attempt = attempt,
+                    "llm_request_start"
                 );
-            }
-
-            let hook_clone = hook.clone();
-            info!(
-                agent_id = %agent_id,
-                conversation_id = %conversation_id,
-                provider = provider,
-                prefix_hash = %self.prefix_hash(),
-                history_len = history.len(),
-                attempt = attempt,
-                "llm_request_start"
-            );
-
-            let start = std::time::Instant::now();
-            let result = match &self.inner {
-                BridgeAgentInner::OpenAI(a) => dispatch_prompt!(a, text, history, hook_clone),
-                BridgeAgentInner::Anthropic(a) => dispatch_prompt!(a, text, history, hook_clone),
-                BridgeAgentInner::Gemini(a) => dispatch_prompt!(a, text, history, hook_clone),
-                BridgeAgentInner::Cohere(a) => dispatch_prompt!(a, text, history, hook_clone),
-            };
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(resp) => {
-                    info!(
-                        agent_id = %agent_id,
-                        conversation_id = %conversation_id,
-                        provider = provider,
-                        input_tokens = resp.total_usage.input_tokens,
-                        cached_input_tokens = resp.total_usage.cached_input_tokens,
-                        cache_hit_ratio = bridge_core::metrics::cache_hit_ratio(
-                            resp.total_usage.input_tokens,
-                            resp.total_usage.cached_input_tokens
-                        ),
-                        output_tokens = resp.total_usage.output_tokens,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_complete"
-                    );
-                    return Ok(resp);
+            },
+            dispatch = |_attempt| {
+                let hook_clone = hook.clone();
+                match &self.inner {
+                    BridgeAgentInner::OpenAI(a) => dispatch_prompt!(a, text, history, hook_clone),
+                    BridgeAgentInner::Anthropic(a) => dispatch_prompt!(a, text, history, hook_clone),
+                    BridgeAgentInner::Gemini(a) => dispatch_prompt!(a, text, history, hook_clone),
+                    BridgeAgentInner::Cohere(a) => dispatch_prompt!(a, text, history, hook_clone),
                 }
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
-                        error!(
-                            agent_id = %agent_id,
-                            conversation_id = %conversation_id,
-                            provider = provider,
-                            error = %e,
-                            latency_ms = latency_ms,
-                            attempt = attempt,
-                            "llm_request_failed_will_retry"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    error!(
-                        agent_id = %agent_id,
-                        conversation_id = %conversation_id,
-                        provider = provider,
-                        error = %e,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_failed"
-                    );
-                    return Err(e);
-                }
-            }
+            },
+            on_success = |resp, attempt, latency_ms| {
+                info!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    input_tokens = resp.total_usage.input_tokens,
+                    cached_input_tokens = resp.total_usage.cached_input_tokens,
+                    cache_hit_ratio = bridge_core::metrics::cache_hit_ratio(
+                        resp.total_usage.input_tokens,
+                        resp.total_usage.cached_input_tokens
+                    ),
+                    output_tokens = resp.total_usage.output_tokens,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_complete"
+                );
+            },
+            on_retry = |err, attempt, latency_ms| {
+                error!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed_will_retry"
+                );
+            },
+            on_fail = |err, attempt, latency_ms| {
+                error!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed"
+                );
+            },
         }
-
-        Err(last_error.unwrap())
     }
 
     /// Run a prompt with history and a tool-call hook, returning just the text output.
@@ -337,11 +401,9 @@ impl BridgeAgent {
         let agent_id = hook.agent_id.clone();
         let conversation_id = hook.conversation_id.clone();
 
-        let mut last_error: Option<PromptError> = None;
-        let mut backoff = INITIAL_BACKOFF;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
+        retry_with_backoff! {
+            success_ty = String,
+            on_backoff = |attempt, backoff, last_err| {
                 warn!(
                     agent_id = %agent_id,
                     conversation_id = %conversation_id,
@@ -349,84 +411,71 @@ impl BridgeAgent {
                     attempt = attempt,
                     max_retries = MAX_RETRIES,
                     backoff_ms = backoff.as_millis() as u64,
-                    error = %last_error.as_ref().unwrap(),
+                    error = %last_err,
                     "llm_request_retry"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * BACKOFF_FACTOR).min(MAX_BACKOFF.as_secs_f64()),
+            },
+            on_start = |attempt| {
+                info!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    prefix_hash = %self.prefix_hash(),
+                    attempt = attempt,
+                    "llm_request_start"
                 );
-            }
-
-            let hook_clone = hook.clone();
-            info!(
-                agent_id = %agent_id,
-                conversation_id = %conversation_id,
-                provider = provider,
-                prefix_hash = %self.prefix_hash(),
-                attempt = attempt,
-                "llm_request_start"
-            );
-
-            let start = std::time::Instant::now();
-            macro_rules! dispatch {
-                ($agent:expr) => {{
-                    $agent
-                        .prompt(text)
-                        .with_history(history)
-                        .with_hook(hook_clone)
-                        .await
-                }};
-            }
-            let result = match &self.inner {
-                BridgeAgentInner::OpenAI(a) => dispatch!(a),
-                BridgeAgentInner::Anthropic(a) => dispatch!(a),
-                BridgeAgentInner::Gemini(a) => dispatch!(a),
-                BridgeAgentInner::Cohere(a) => dispatch!(a),
-            };
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(output) => {
-                    info!(
-                        agent_id = %agent_id,
-                        conversation_id = %conversation_id,
-                        provider = provider,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_complete"
-                    );
-                    return Ok(output);
+            },
+            dispatch = |_attempt| {
+                let hook_clone = hook.clone();
+                macro_rules! dispatch {
+                    ($agent:expr) => {{
+                        $agent
+                            .prompt(text)
+                            .with_history(history)
+                            .with_hook(hook_clone)
+                            .await
+                    }};
                 }
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
-                        error!(
-                            agent_id = %agent_id,
-                            conversation_id = %conversation_id,
-                            provider = provider,
-                            error = %e,
-                            latency_ms = latency_ms,
-                            attempt = attempt,
-                            "llm_request_failed_will_retry"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    error!(
-                        agent_id = %agent_id,
-                        conversation_id = %conversation_id,
-                        provider = provider,
-                        error = %e,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_failed"
-                    );
-                    return Err(e);
+                match &self.inner {
+                    BridgeAgentInner::OpenAI(a) => dispatch!(a),
+                    BridgeAgentInner::Anthropic(a) => dispatch!(a),
+                    BridgeAgentInner::Gemini(a) => dispatch!(a),
+                    BridgeAgentInner::Cohere(a) => dispatch!(a),
                 }
-            }
+            },
+            on_success = |_output, attempt, latency_ms| {
+                info!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_complete"
+                );
+            },
+            on_retry = |err, attempt, latency_ms| {
+                error!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed_will_retry"
+                );
+            },
+            on_fail = |err, attempt, latency_ms| {
+                error!(
+                    agent_id = %agent_id,
+                    conversation_id = %conversation_id,
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed"
+                );
+            },
         }
-
-        Err(last_error.unwrap())
     }
 
     /// Prompt with history but no hooks. Returns just the text output.
@@ -440,76 +489,61 @@ impl BridgeAgent {
     ) -> Result<String, PromptError> {
         let provider = self.provider_name();
 
-        let mut last_error: Option<PromptError> = None;
-        let mut backoff = INITIAL_BACKOFF;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
+        retry_with_backoff! {
+            success_ty = String,
+            on_backoff = |attempt, backoff, last_err| {
                 warn!(
                     provider = provider,
                     attempt = attempt,
                     max_retries = MAX_RETRIES,
                     backoff_ms = backoff.as_millis() as u64,
-                    error = %last_error.as_ref().unwrap(),
+                    error = %last_err,
                     "llm_request_retry"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * BACKOFF_FACTOR).min(MAX_BACKOFF.as_secs_f64()),
+            },
+            on_start = |attempt| {
+                info!(provider = provider, prefix_hash = %self.prefix_hash(), attempt = attempt, "llm_request_start");
+            },
+            dispatch = |_attempt| {
+                macro_rules! dispatch {
+                    ($agent:expr) => {{
+                        $agent.prompt(text).with_history(history).await
+                    }};
+                }
+                match &self.inner {
+                    BridgeAgentInner::OpenAI(a) => dispatch!(a),
+                    BridgeAgentInner::Anthropic(a) => dispatch!(a),
+                    BridgeAgentInner::Gemini(a) => dispatch!(a),
+                    BridgeAgentInner::Cohere(a) => dispatch!(a),
+                }
+            },
+            on_success = |_output, attempt, latency_ms| {
+                info!(
+                    provider = provider,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_complete"
                 );
-            }
-
-            info!(provider = provider, prefix_hash = %self.prefix_hash(), attempt = attempt, "llm_request_start");
-
-            let start = std::time::Instant::now();
-            macro_rules! dispatch {
-                ($agent:expr) => {{
-                    $agent.prompt(text).with_history(history).await
-                }};
-            }
-            let result = match &self.inner {
-                BridgeAgentInner::OpenAI(a) => dispatch!(a),
-                BridgeAgentInner::Anthropic(a) => dispatch!(a),
-                BridgeAgentInner::Gemini(a) => dispatch!(a),
-                BridgeAgentInner::Cohere(a) => dispatch!(a),
-            };
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(output) => {
-                    info!(
-                        provider = provider,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_complete"
-                    );
-                    return Ok(output);
-                }
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
-                        error!(
-                            provider = provider,
-                            error = %e,
-                            latency_ms = latency_ms,
-                            attempt = attempt,
-                            "llm_request_failed_will_retry"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    error!(
-                        provider = provider,
-                        error = %e,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_failed"
-                    );
-                    return Err(e);
-                }
-            }
+            },
+            on_retry = |err, attempt, latency_ms| {
+                error!(
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed_will_retry"
+                );
+            },
+            on_fail = |err, attempt, latency_ms| {
+                error!(
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed"
+                );
+            },
         }
-
-        Err(last_error.unwrap())
     }
 
     /// Stream a prompt with history and a tool-call hook, returning a
@@ -546,71 +580,56 @@ impl BridgeAgent {
     pub async fn prompt_simple(&self, text: &str) -> Result<String, PromptError> {
         let provider = self.provider_name();
 
-        let mut last_error: Option<PromptError> = None;
-        let mut backoff = INITIAL_BACKOFF;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
+        retry_with_backoff! {
+            success_ty = String,
+            on_backoff = |attempt, backoff, last_err| {
                 warn!(
                     provider = provider,
                     attempt = attempt,
                     max_retries = MAX_RETRIES,
                     backoff_ms = backoff.as_millis() as u64,
-                    error = %last_error.as_ref().unwrap(),
+                    error = %last_err,
                     "llm_request_retry"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * BACKOFF_FACTOR).min(MAX_BACKOFF.as_secs_f64()),
+            },
+            on_start = |attempt| {
+                info!(provider = provider, prefix_hash = %self.prefix_hash(), attempt = attempt, "llm_request_start");
+            },
+            dispatch = |_attempt| {
+                match &self.inner {
+                    BridgeAgentInner::OpenAI(a) => dispatch_prompt_simple!(a, text),
+                    BridgeAgentInner::Anthropic(a) => dispatch_prompt_simple!(a, text),
+                    BridgeAgentInner::Gemini(a) => dispatch_prompt_simple!(a, text),
+                    BridgeAgentInner::Cohere(a) => dispatch_prompt_simple!(a, text),
+                }
+            },
+            on_success = |_output, attempt, latency_ms| {
+                info!(
+                    provider = provider,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_complete"
                 );
-            }
-
-            info!(provider = provider, prefix_hash = %self.prefix_hash(), attempt = attempt, "llm_request_start");
-
-            let start = std::time::Instant::now();
-            let result = match &self.inner {
-                BridgeAgentInner::OpenAI(a) => dispatch_prompt_simple!(a, text),
-                BridgeAgentInner::Anthropic(a) => dispatch_prompt_simple!(a, text),
-                BridgeAgentInner::Gemini(a) => dispatch_prompt_simple!(a, text),
-                BridgeAgentInner::Cohere(a) => dispatch_prompt_simple!(a, text),
-            };
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(output) => {
-                    info!(
-                        provider = provider,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_complete"
-                    );
-                    return Ok(output);
-                }
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
-                        error!(
-                            provider = provider,
-                            error = %e,
-                            latency_ms = latency_ms,
-                            attempt = attempt,
-                            "llm_request_failed_will_retry"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    error!(
-                        provider = provider,
-                        error = %e,
-                        latency_ms = latency_ms,
-                        attempt = attempt,
-                        "llm_request_failed"
-                    );
-                    return Err(e);
-                }
-            }
+            },
+            on_retry = |err, attempt, latency_ms| {
+                error!(
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed_will_retry"
+                );
+            },
+            on_fail = |err, attempt, latency_ms| {
+                error!(
+                    provider = provider,
+                    error = %err,
+                    latency_ms = latency_ms,
+                    attempt = attempt,
+                    "llm_request_failed"
+                );
+            },
         }
-
-        Err(last_error.unwrap())
     }
 }
 

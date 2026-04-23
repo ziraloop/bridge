@@ -27,6 +27,7 @@
 //! document the endpoint shapes — actual network I/O is left for a
 //! follow-up once real API-key integration tests are wired.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -147,6 +148,7 @@ pub struct CacheResourcePool {
     backend: Arc<dyn CacheResourceBackend>,
     entries: DashMap<PrefixHash, Arc<Mutex<CacheEntry>>>,
     config: PoolConfig,
+    total_tokens: AtomicU64,
 }
 
 /// Outcome of [`CacheResourcePool::get_or_create`].
@@ -175,6 +177,7 @@ impl CacheResourcePool {
             backend,
             entries: DashMap::new(),
             config,
+            total_tokens: AtomicU64::new(0),
         }
     }
 
@@ -184,15 +187,7 @@ impl CacheResourcePool {
 
     /// Aggregate retained token count across all live entries.
     pub fn storage_tokens(&self) -> u64 {
-        let mut sum: u64 = 0;
-        for entry in self.entries.iter() {
-            // Non-blocking probe: if locked, approximate as zero for this
-            // snapshot. Accounting corrects itself on the next eviction.
-            if let Ok(g) = entry.value().try_lock() {
-                sum = sum.saturating_add(g.token_count);
-            }
-        }
-        sum
+        self.total_tokens.load(Ordering::Relaxed)
     }
 
     pub fn entry_count(&self) -> usize {
@@ -266,6 +261,8 @@ impl CacheResourcePool {
             payload.prefix_hash.clone(),
             Arc::new(Mutex::new(entry.clone())),
         );
+        self.total_tokens
+            .fetch_add(entry.token_count, Ordering::Relaxed);
 
         info!(
             provider = ?entry.provider,
@@ -288,12 +285,16 @@ impl CacheResourcePool {
     /// Evict everything owned by `agent_id` (typically called on agent
     /// shutdown). Returns the ids that were successfully deleted.
     pub async fn evict_by_owner(&self, agent_id: &str) -> Vec<String> {
-        let targets: Vec<(PrefixHash, String)> = {
+        let targets: Vec<(PrefixHash, String, u64)> = {
             let mut v = Vec::new();
             for entry in self.entries.iter() {
                 if let Ok(g) = entry.value().try_lock() {
                     if g.owner_agent_id == agent_id {
-                        v.push((entry.key().clone(), g.provider_cache_id.clone()));
+                        v.push((
+                            entry.key().clone(),
+                            g.provider_cache_id.clone(),
+                            g.token_count,
+                        ));
                     }
                 }
             }
@@ -301,7 +302,7 @@ impl CacheResourcePool {
         };
 
         let mut deleted = Vec::with_capacity(targets.len());
-        for (prefix, cache_id) in targets {
+        for (prefix, cache_id, tokens) in targets {
             if let Err(e) = self.backend.delete(&cache_id).await {
                 warn!(
                     provider_cache_id = %cache_id,
@@ -310,7 +311,9 @@ impl CacheResourcePool {
                 );
                 continue;
             }
-            self.entries.remove(&prefix);
+            if self.entries.remove(&prefix).is_some() {
+                self.total_tokens.fetch_sub(tokens, Ordering::Relaxed);
+            }
             deleted.push(cache_id);
         }
         deleted
@@ -319,21 +322,27 @@ impl CacheResourcePool {
     /// Remove entries whose `expires_at` is in the past. Called on a timer.
     pub async fn evict_expired(&self) -> Vec<String> {
         let now = Utc::now();
-        let expired: Vec<(PrefixHash, String)> = {
+        let expired: Vec<(PrefixHash, String, u64)> = {
             let mut v = Vec::new();
             for entry in self.entries.iter() {
                 if let Ok(g) = entry.value().try_lock() {
                     if g.expires_at <= now {
-                        v.push((entry.key().clone(), g.provider_cache_id.clone()));
+                        v.push((
+                            entry.key().clone(),
+                            g.provider_cache_id.clone(),
+                            g.token_count,
+                        ));
                     }
                 }
             }
             v
         };
-        for (p, _) in &expired {
-            self.entries.remove(p);
+        for (p, _, tokens) in &expired {
+            if self.entries.remove(p).is_some() {
+                self.total_tokens.fetch_sub(*tokens, Ordering::Relaxed);
+            }
         }
-        expired.into_iter().map(|(_, id)| id).collect()
+        expired.into_iter().map(|(_, id, _)| id).collect()
     }
 
     /// Evict until both entry-count and storage-tokens are within budget.
@@ -346,43 +355,52 @@ impl CacheResourcePool {
                 break;
             }
             // Find the LRU entry.
-            let mut oldest: Option<(PrefixHash, String, DateTime<Utc>)> = None;
+            let mut oldest: Option<(PrefixHash, String, DateTime<Utc>, u64)> = None;
             for entry in self.entries.iter() {
                 if let Ok(g) = entry.value().try_lock() {
                     let ts = g.last_hit_at;
                     let cid = g.provider_cache_id.clone();
+                    let tokens = g.token_count;
                     let better = match oldest {
-                        Some((_, _, prev)) => ts < prev,
+                        Some((_, _, prev, _)) => ts < prev,
                         None => true,
                     };
                     if better {
-                        oldest = Some((entry.key().clone(), cid, ts));
+                        oldest = Some((entry.key().clone(), cid, ts, tokens));
                     }
                 }
             }
-            let Some((victim, cache_id, _)) = oldest else {
+            let Some((victim, cache_id, _, tokens)) = oldest else {
                 break;
             };
             let _ = self.backend.delete(&cache_id).await;
-            self.entries.remove(&victim);
+            if self.entries.remove(&victim).is_some() {
+                self.total_tokens.fetch_sub(tokens, Ordering::Relaxed);
+            }
         }
     }
 
     /// Bulk delete everything. Call on process shutdown — otherwise the
     /// server keeps billing for storage until TTL expiry.
     pub async fn shutdown(&self) {
-        let ids: Vec<(PrefixHash, String)> = {
+        let ids: Vec<(PrefixHash, String, u64)> = {
             let mut v = Vec::new();
             for entry in self.entries.iter() {
                 if let Ok(g) = entry.value().try_lock() {
-                    v.push((entry.key().clone(), g.provider_cache_id.clone()));
+                    v.push((
+                        entry.key().clone(),
+                        g.provider_cache_id.clone(),
+                        g.token_count,
+                    ));
                 }
             }
             v
         };
-        for (prefix, cache_id) in ids {
+        for (prefix, cache_id, tokens) in ids {
             let _ = self.backend.delete(&cache_id).await;
-            self.entries.remove(&prefix);
+            if self.entries.remove(&prefix).is_some() {
+                self.total_tokens.fetch_sub(tokens, Ordering::Relaxed);
+            }
         }
     }
 }
