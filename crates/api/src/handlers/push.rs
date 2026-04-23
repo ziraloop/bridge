@@ -41,12 +41,30 @@ pub struct PushAgentsResponse {
     pub loaded: usize,
 }
 
+/// Status of an upsert operation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum UpsertStatus {
+    Unchanged,
+    Updated,
+    Created,
+}
+
 /// Response for upserting an agent.
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct UpsertAgentResponse {
     /// Status of the operation: "unchanged", "updated", or "created".
-    pub status: String,
+    pub status: UpsertStatus,
+}
+
+/// Status of a remove operation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum RemoveStatus {
+    Removed,
 }
 
 /// Response for removing an agent.
@@ -54,7 +72,7 @@ pub struct UpsertAgentResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RemoveAgentResponse {
     /// Status of the operation.
-    pub status: String,
+    pub status: RemoveStatus,
 }
 
 /// Response for hydrating conversations.
@@ -65,12 +83,20 @@ pub struct HydrateConversationsResponse {
     pub hydrated: usize,
 }
 
+/// Status of an API key update operation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum UpdateApiKeyStatus {
+    Updated,
+}
+
 /// Response for updating an API key.
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct UpdateApiKeyResponse {
     /// Status of the operation.
-    pub status: String,
+    pub status: UpdateApiKeyStatus,
 }
 
 /// Response for pushing a diff.
@@ -159,7 +185,7 @@ pub async fn upsert_agent(
             return Ok((
                 StatusCode::OK,
                 Json(UpsertAgentResponse {
-                    status: "unchanged".to_string(),
+                    status: UpsertStatus::Unchanged,
                 }),
             ));
         }
@@ -172,7 +198,7 @@ pub async fn upsert_agent(
         Ok((
             StatusCode::OK,
             Json(UpsertAgentResponse {
-                status: "updated".to_string(),
+                status: UpsertStatus::Updated,
             }),
         ))
     } else {
@@ -185,7 +211,7 @@ pub async fn upsert_agent(
         Ok((
             StatusCode::CREATED,
             Json(UpsertAgentResponse {
-                status: "created".to_string(),
+                status: UpsertStatus::Created,
             }),
         ))
     }
@@ -216,7 +242,7 @@ pub async fn remove_agent(
         .apply_diff(vec![], vec![], vec![agent_id])
         .await?;
     Ok(Json(RemoveAgentResponse {
-        status: "removed".to_string(),
+        status: RemoveStatus::Removed,
     }))
 }
 
@@ -290,7 +316,7 @@ pub async fn update_agent_api_key(
         .update_agent_api_key(&agent_id, body.api_key)
         .await?;
     Ok(Json(UpdateApiKeyResponse {
-        status: "updated".to_string(),
+        status: UpdateApiKeyStatus::Updated,
     }))
 }
 

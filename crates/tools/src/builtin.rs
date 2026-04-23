@@ -20,23 +20,26 @@ fn maybe_register(
     registry.register(tool);
 }
 
-/// Register all built-in tools into the given registry.
-/// Filesystem tools are always registered.
-/// WebSearch is registered only when SEARCH_ENDPOINT env var is set.
-/// If an `LspManager` is provided, the LSP tool is also registered.
-pub fn register_builtin_tools(registry: &mut ToolRegistry) {
-    register_builtin_tools_with_lsp(registry, None);
+struct RegisterFlags {
+    include_agent_tool: bool,
+    include_sub_agent_tool: bool,
+    include_batch_tool: bool,
+    include_ping_me_back_tools: bool,
+    lsp_manager: Option<Arc<LspManager>>,
 }
 
-/// Register all built-in tools, optionally including the LSP tool.
-pub fn register_builtin_tools_with_lsp(
-    registry: &mut ToolRegistry,
-    lsp_manager: Option<Arc<LspManager>>,
-) {
+fn register_core_tools(registry: &mut ToolRegistry, flags: RegisterFlags) {
+    let RegisterFlags {
+        include_agent_tool,
+        include_sub_agent_tool,
+        include_batch_tool,
+        include_ping_me_back_tools,
+        lsp_manager,
+    } = flags;
+
     let tracker = FileTracker::new();
     let boundary = ProjectBoundary::new(std::env::current_dir().unwrap_or_default());
 
-    // Filesystem search tools
     registry.register(Arc::new(
         crate::read::ReadTool::new()
             .with_file_tracker(tracker.clone())
@@ -53,7 +56,6 @@ pub fn register_builtin_tools_with_lsp(
         crate::rip_grep::RipGrepTool::new().with_boundary(boundary.clone()),
     ));
 
-    // Write-side tools (with LSP manager for diagnostics)
     registry.register(Arc::new(crate::bash::BashTool::new()));
     registry.register(Arc::new(
         crate::edit::EditTool::new()
@@ -77,7 +79,6 @@ pub fn register_builtin_tools_with_lsp(
             .with_lsp_manager_opt(lsp_manager.clone()),
     ));
 
-    // Web fetch (with optional fallback service for JS-heavy / bot-protected sites)
     let web_fetch_tool = if let Ok(url) = std::env::var("BRIDGE_WEB_URL") {
         crate::web_fetch::WebFetchTool::with_fallback(url)
     } else {
@@ -85,7 +86,6 @@ pub fn register_builtin_tools_with_lsp(
     };
     registry.register(Arc::new(web_fetch_tool));
 
-    // Spider-backed web tools (search, crawl, links, screenshot, transform)
     if let Ok(base_url) = std::env::var("BRIDGE_WEB_URL") {
         let spider = Arc::new(crate::spider_tools::SpiderClient::new(base_url));
         registry.register(Arc::new(crate::spider_tools::WebCrawlTool::new(
@@ -103,39 +103,63 @@ pub fn register_builtin_tools_with_lsp(
         registry.register(Arc::new(crate::spider_tools::WebTransformTool::new(spider)));
     }
 
-    // Todo tools — shared state between read and write
     let todo_state = TodoState::new();
     registry.register(Arc::new(crate::todo::TodoWriteTool::with_state(
         todo_state.clone(),
     )));
     registry.register(Arc::new(crate::todo::TodoReadTool::with_state(todo_state)));
 
-    // LSP tool — code intelligence (only if manager provided)
     if let Some(manager) = lsp_manager {
         registry.register(Arc::new(crate::lsp_tool::LspTool::new(manager)));
     }
 
-    // Ping-me-back tools — non-blocking delayed self-reminder
-    let ping_state = crate::ping_me_back::PingState::new();
-    registry.register(Arc::new(crate::ping_me_back::PingMeBackTool::new(
-        ping_state.clone(),
-    )));
-    registry.register(Arc::new(crate::ping_me_back::CancelPingTool::new(
-        ping_state,
-    )));
+    if include_ping_me_back_tools {
+        let ping_state = crate::ping_me_back::PingState::new();
+        registry.register(Arc::new(crate::ping_me_back::PingMeBackTool::new(
+            ping_state.clone(),
+        )));
+        registry.register(Arc::new(crate::ping_me_back::CancelPingTool::new(
+            ping_state,
+        )));
+    }
 
-    // Self-delegation agent tool (uses task_local for context)
-    registry.register(Arc::new(crate::self_agent::AgentTool::new()));
+    if include_agent_tool {
+        registry.register(Arc::new(crate::self_agent::AgentTool::new()));
+    }
 
-    // Sub-agent tool — subagent invocation (uses task_local for context).
-    // Supports fire-and-forget background execution via `run_in_background: true`;
-    // background results are injected into the next user turn by the
-    // conversation loop. No explicit join/wait tool is needed.
-    registry.register(Arc::new(crate::agent::SubAgentTool::new()));
+    if include_sub_agent_tool {
+        registry.register(Arc::new(crate::agent::SubAgentTool::new()));
+    }
 
-    // Batch tool — registered last with a snapshot of all other tools
-    let tool_snapshot = registry.snapshot();
-    registry.register(Arc::new(crate::batch::BatchTool::new(tool_snapshot)));
+    if include_batch_tool {
+        let tool_snapshot = registry.snapshot();
+        registry.register(Arc::new(crate::batch::BatchTool::new(tool_snapshot)));
+    }
+}
+
+/// Register all built-in tools into the given registry.
+/// Filesystem tools are always registered.
+/// WebSearch is registered only when SEARCH_ENDPOINT env var is set.
+/// If an `LspManager` is provided, the LSP tool is also registered.
+pub fn register_builtin_tools(registry: &mut ToolRegistry) {
+    register_builtin_tools_with_lsp(registry, None);
+}
+
+/// Register all built-in tools, optionally including the LSP tool.
+pub fn register_builtin_tools_with_lsp(
+    registry: &mut ToolRegistry,
+    lsp_manager: Option<Arc<LspManager>>,
+) {
+    register_core_tools(
+        registry,
+        RegisterFlags {
+            include_agent_tool: true,
+            include_sub_agent_tool: true,
+            include_batch_tool: true,
+            include_ping_me_back_tools: true,
+            lsp_manager,
+        },
+    );
 }
 
 /// Register built-in tools for subagents (excludes the agent tool).
@@ -143,86 +167,16 @@ pub fn register_builtin_tools_with_lsp(
 /// Subagents are leaf-level workers and should not be able to spawn
 /// other subagents. This prevents unbounded recursion.
 pub fn register_builtin_tools_for_subagent(registry: &mut ToolRegistry) {
-    let tracker = FileTracker::new();
-    let boundary = ProjectBoundary::new(std::env::current_dir().unwrap_or_default());
-
-    // Filesystem tools
-    registry.register(Arc::new(
-        crate::read::ReadTool::new()
-            .with_file_tracker(tracker.clone())
-            .with_boundary(boundary.clone()),
-    ));
-    registry.register(Arc::new(
-        crate::glob::GlobTool::new().with_boundary(boundary.clone()),
-    ));
-    registry.register(Arc::new(crate::ls::LsTool::new()));
-    registry.register(Arc::new(
-        crate::ast_grep::AstGrepTool::new().with_boundary(boundary.clone()),
-    ));
-    registry.register(Arc::new(
-        crate::rip_grep::RipGrepTool::new().with_boundary(boundary.clone()),
-    ));
-
-    // Write-side tools
-    registry.register(Arc::new(crate::bash::BashTool::new()));
-    registry.register(Arc::new(
-        crate::edit::EditTool::new()
-            .with_file_tracker(tracker.clone())
-            .with_boundary(boundary.clone()),
-    ));
-    registry.register(Arc::new(
-        crate::write::WriteTool::new()
-            .with_file_tracker(tracker.clone())
-            .with_boundary(boundary.clone()),
-    ));
-    registry.register(Arc::new(crate::apply_patch::ApplyPatchTool::new()));
-    registry.register(Arc::new(
-        crate::multiedit::MultiEditTool::new()
-            .with_file_tracker(tracker)
-            .with_boundary(boundary),
-    ));
-
-    // Web fetch (with optional fallback service for JS-heavy / bot-protected sites)
-    let web_fetch_tool = if let Ok(url) = std::env::var("BRIDGE_WEB_URL") {
-        crate::web_fetch::WebFetchTool::with_fallback(url)
-    } else {
-        crate::web_fetch::WebFetchTool::with_defaults()
-    };
-    registry.register(Arc::new(web_fetch_tool));
-
-    // Spider-backed web tools (search, crawl, links, screenshot, transform)
-    if let Ok(base_url) = std::env::var("BRIDGE_WEB_URL") {
-        let spider = Arc::new(crate::spider_tools::SpiderClient::new(base_url));
-        registry.register(Arc::new(crate::spider_tools::WebCrawlTool::new(
-            spider.clone(),
-        )));
-        registry.register(Arc::new(crate::spider_tools::WebSearchTool::new(
-            spider.clone(),
-        )));
-        registry.register(Arc::new(crate::spider_tools::WebGetLinksTool::new(
-            spider.clone(),
-        )));
-        registry.register(Arc::new(crate::spider_tools::WebScreenshotTool::new(
-            spider.clone(),
-        )));
-        registry.register(Arc::new(crate::spider_tools::WebTransformTool::new(spider)));
-    }
-
-    // Todo tools — shared state between read and write
-    let todo_state = TodoState::new();
-    registry.register(Arc::new(crate::todo::TodoWriteTool::with_state(
-        todo_state.clone(),
-    )));
-    registry.register(Arc::new(crate::todo::TodoReadTool::with_state(todo_state)));
-
-    // No ping-me-back tools — subagents don't have their own conversation
-    // loop with PingState wired into the select!, so these would be no-ops.
-
-    // No agent tool — subagents cannot spawn other subagents
-
-    // Batch tool — registered last with a snapshot of all other tools
-    let tool_snapshot = registry.snapshot();
-    registry.register(Arc::new(crate::batch::BatchTool::new(tool_snapshot)));
+    register_core_tools(
+        registry,
+        RegisterFlags {
+            include_agent_tool: false,
+            include_sub_agent_tool: false,
+            include_batch_tool: true,
+            include_ping_me_back_tools: false,
+            lsp_manager: None,
+        },
+    );
 }
 
 /// Register only the built-in tools whose names appear in `allowed_tools`.

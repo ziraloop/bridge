@@ -29,6 +29,23 @@ use webhooks::EventBus;
 /// tool: builtin, MCP, integration, skill, and subagent results.
 const TOOL_RESULT_MAX_BYTES: usize = 2048;
 
+enum SpecialTool {
+    Bash,
+    Agent,
+    SubAgent,
+}
+
+impl SpecialTool {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bash" => Some(Self::Bash),
+            "agent" => Some(Self::Agent),
+            "sub_agent" => Some(Self::SubAgent),
+            _ => None,
+        }
+    }
+}
+
 /// Validate tool arguments against a JSON schema.
 /// Returns Ok(()) if valid, Err(message) with human-readable validation errors if not.
 fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
@@ -406,54 +423,52 @@ impl<M: CompletionModel> PromptHook<M> for ToolCallEmitter {
             }
         }
 
-        // Intercept bash calls with background: true.
-        if effective_name == "bash" {
-            if let Ok(bash_args) = serde_json::from_str::<BashArgs>(args) {
-                if bash_args.background {
+        match SpecialTool::from_name(&effective_name) {
+            Some(SpecialTool::Bash) => {
+                if let Ok(bash_args) = serde_json::from_str::<BashArgs>(args) {
+                    if bash_args.background {
+                        info!(
+                            agent_id = %self.agent_id,
+                            conversation_id = %self.conversation_id,
+                            command = %Truncated::new(&bash_args.command, 100),
+                            task_description = bash_args.description.as_deref().unwrap_or(""),
+                            "background_task_spawn"
+                        );
+                        return self
+                            .handle_background_bash(bash_args, id_for_bg, call_start)
+                            .await;
+                    }
+                }
+            }
+            Some(SpecialTool::Agent) => {
+                if let Ok(agent_params) = serde_json::from_str::<AgentToolParams>(args) {
                     info!(
                         agent_id = %self.agent_id,
                         conversation_id = %self.conversation_id,
-                        command = %Truncated::new(&bash_args.command, 100),
-                        task_description = bash_args.description.as_deref().unwrap_or(""),
-                        "background_task_spawn"
+                        subagent_name = "__self__",
+                        mode = if agent_params.run_in_background { "background" } else { "foreground" },
+                        "subagent_spawn"
                     );
                     return self
-                        .handle_background_bash(bash_args, id_for_bg, call_start)
+                        .handle_self_agent_tool(agent_params, id_for_bg, call_start)
                         .await;
                 }
             }
-        }
-
-        // Intercept self-delegation agent tool calls (AGENT_CONTEXT is only available here).
-        if effective_name == "agent" {
-            if let Ok(agent_params) = serde_json::from_str::<AgentToolParams>(args) {
-                info!(
-                    agent_id = %self.agent_id,
-                    conversation_id = %self.conversation_id,
-                    subagent_name = "__self__",
-                    mode = if agent_params.run_in_background { "background" } else { "foreground" },
-                    "subagent_spawn"
-                );
-                return self
-                    .handle_self_agent_tool(agent_params, id_for_bg, call_start)
-                    .await;
+            Some(SpecialTool::SubAgent) => {
+                if let Ok(sub_agent_params) = serde_json::from_str::<SubAgentToolParams>(args) {
+                    info!(
+                        agent_id = %self.agent_id,
+                        conversation_id = %self.conversation_id,
+                        subagent_name = %sub_agent_params.subagent_name,
+                        mode = if sub_agent_params.run_in_background { "background" } else { "foreground" },
+                        "subagent_spawn"
+                    );
+                    return self
+                        .handle_sub_agent_tool(sub_agent_params, id_for_bg, call_start)
+                        .await;
+                }
             }
-        }
-
-        // Intercept sub_agent tool calls (AGENT_CONTEXT is only available here).
-        if effective_name == "sub_agent" {
-            if let Ok(sub_agent_params) = serde_json::from_str::<SubAgentToolParams>(args) {
-                info!(
-                    agent_id = %self.agent_id,
-                    conversation_id = %self.conversation_id,
-                    subagent_name = %sub_agent_params.subagent_name,
-                    mode = if sub_agent_params.run_in_background { "background" } else { "foreground" },
-                    "subagent_spawn"
-                );
-                return self
-                    .handle_sub_agent_tool(sub_agent_params, id_for_bg, call_start)
-                    .await;
-            }
+            None => {}
         }
 
         // If the name was repaired, rig-core won't find the tool under the
