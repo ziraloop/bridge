@@ -1,8 +1,9 @@
 //! Webhook HTTP delivery pipeline for `BridgeEvent`.
 //!
-//! Receives events from the EventBus via an unbounded channel, routes them
+//! Receives events from the EventBus via a bounded channel, routes them
 //! to per-conversation workers for ordered delivery, and batches events
-//! when multiple queue up.
+//! when multiple queue up. When the per-conversation channel is full the
+//! incoming event is dropped with a warn log (drop-newest-on-full).
 
 use bridge_core::config::WebhookConfig;
 use bridge_core::event::BridgeEvent;
@@ -15,6 +16,10 @@ use storage::StorageHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+/// Per-conversation channel capacity for the webhook delivery pipeline.
+/// Events beyond this depth are dropped with a warn log.
+pub const PER_CONVERSATION_CHANNEL_CAPACITY: usize = 1024;
 
 /// Per-worker delivery settings.
 #[derive(Clone, Copy)]
@@ -30,7 +35,7 @@ struct WorkerConfig {
 /// workers for ordered delivery, and signs payloads using the provided
 /// webhook URL and secret.
 pub async fn run_delivery(
-    mut rx: mpsc::UnboundedReceiver<BridgeEvent>,
+    mut rx: mpsc::Receiver<BridgeEvent>,
     client: Client,
     cancel: CancellationToken,
     config: WebhookConfig,
@@ -46,7 +51,7 @@ pub async fn run_delivery(
         idle_timeout: Duration::from_secs(config.worker_idle_timeout_secs),
     };
 
-    let mut workers: HashMap<String, mpsc::UnboundedSender<BridgeEvent>> = HashMap::new();
+    let mut workers: HashMap<String, mpsc::Sender<BridgeEvent>> = HashMap::new();
     let mut worker_handles: JoinSet<String> = JoinSet::new();
     let delivered = Arc::new(AtomicU64::new(0));
 
@@ -112,7 +117,7 @@ pub async fn run_delivery(
 #[allow(clippy::too_many_arguments)]
 fn route_event(
     event: BridgeEvent,
-    workers: &mut HashMap<String, mpsc::UnboundedSender<BridgeEvent>>,
+    workers: &mut HashMap<String, mpsc::Sender<BridgeEvent>>,
     worker_handles: &mut JoinSet<String>,
     client: &Client,
     semaphore: &Arc<tokio::sync::Semaphore>,
@@ -125,15 +130,25 @@ fn route_event(
     let conv_id = event.conversation_id.clone();
 
     let event = match workers.get(&conv_id) {
-        Some(tx) => match tx.send(event) {
+        Some(tx) => match tx.try_send(event) {
             Ok(()) => return,
-            Err(e) => e.0,
+            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                tracing::warn!(
+                    conversation_id = %dropped.conversation_id,
+                    event_id = %dropped.event_id,
+                    sequence_number = dropped.sequence_number,
+                    capacity = PER_CONVERSATION_CHANNEL_CAPACITY,
+                    "webhook channel full, dropping event"
+                );
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(ev)) => ev,
         },
         None => event,
     };
 
-    let (tx, worker_rx) = mpsc::unbounded_channel();
-    tx.send(event).expect("fresh channel cannot be closed");
+    let (tx, worker_rx) = mpsc::channel(PER_CONVERSATION_CHANNEL_CAPACITY);
+    tx.try_send(event).expect("fresh channel cannot be full or closed");
     workers.insert(conv_id.clone(), tx);
 
     let worker_client = client.clone();
@@ -163,7 +178,7 @@ fn route_event(
 #[allow(clippy::too_many_arguments)]
 async fn conversation_worker(
     _conversation_id: &str,
-    mut rx: mpsc::UnboundedReceiver<BridgeEvent>,
+    mut rx: mpsc::Receiver<BridgeEvent>,
     client: Client,
     semaphore: Arc<tokio::sync::Semaphore>,
     config: WorkerConfig,
@@ -238,6 +253,9 @@ async fn deliver_batch(
     let secret = webhook_secret.to_string();
     let start = std::time::Instant::now();
     let attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Generated once per batch; reused across all retry attempts so consumers
+    // can dedupe. Not included in the HMAC-signed payload.
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
 
     let result = (|| {
         let client = client.clone();
@@ -245,6 +263,7 @@ async fn deliver_batch(
         let secret = secret.clone();
         let body = body.clone();
         let attempt = attempt.clone();
+        let idempotency_key = idempotency_key.clone();
         async move {
             let attempt_num = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
@@ -263,6 +282,7 @@ async fn deliver_batch(
                 .header("Content-Type", "application/json")
                 .header("X-Webhook-Signature", &signature)
                 .header("X-Webhook-Timestamp", timestamp.to_string())
+                .header("X-Bridge-Idempotency-Key", &idempotency_key)
                 .body(body)
                 .timeout(timeout)
                 .send()
@@ -320,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delivery_exits_on_cancel() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::channel(PER_CONVERSATION_CHANNEL_CAPACITY);
         let client = Client::new();
         let cancel = CancellationToken::new();
         let config = WebhookConfig::default();
@@ -366,11 +386,11 @@ mod tests {
             ..WebhookConfig::default()
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PER_CONVERSATION_CHANNEL_CAPACITY);
         let client = Client::new();
         let cancel = CancellationToken::new();
 
-        tx.send(make_event("conv-1")).unwrap();
+        tx.send(make_event("conv-1")).await.unwrap();
 
         let cancel_clone = cancel.clone();
         let url = mock_server.uri();
@@ -425,7 +445,7 @@ mod tests {
             ..WebhookConfig::default()
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PER_CONVERSATION_CHANNEL_CAPACITY);
         let client = Client::new();
         let cancel = CancellationToken::new();
 
@@ -433,7 +453,7 @@ mod tests {
         for i in 1..=5 {
             let mut event = make_event("conv-1");
             event.sequence_number = i;
-            tx.send(event).unwrap();
+            tx.send(event).await.unwrap();
         }
 
         let cancel_clone = cancel.clone();
@@ -486,18 +506,18 @@ mod tests {
             ..WebhookConfig::default()
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PER_CONVERSATION_CHANNEL_CAPACITY);
         let client = Client::new();
         let cancel = CancellationToken::new();
 
         for i in 0..3 {
             let mut e_a = make_event("conv-A");
             e_a.sequence_number = (i * 2 + 1) as u64;
-            tx.send(e_a).unwrap();
+            tx.send(e_a).await.unwrap();
 
             let mut e_b = make_event("conv-B");
             e_b.sequence_number = (i * 2 + 2) as u64;
-            tx.send(e_b).unwrap();
+            tx.send(e_b).await.unwrap();
         }
 
         let cancel_clone = cancel.clone();

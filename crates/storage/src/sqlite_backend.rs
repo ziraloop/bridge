@@ -88,34 +88,38 @@ impl StorageBackend for SqliteBackend {
         let agent_id = agent_id.to_string();
         self.conn
             .call(move |conn| {
-                // Delete conversations' messages first
-                let mut stmt =
-                    conn.prepare("SELECT conversation_id FROM conversations WHERE agent_id = ?1")?;
-                let conv_ids: Vec<String> = stmt
-                    .query_map(params![agent_id], |row| row.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                for conv_id in &conv_ids {
-                    conn.execute(
-                        "DELETE FROM messages WHERE conversation_id = ?1",
-                        params![conv_id],
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare(
+                        "SELECT conversation_id FROM conversations WHERE agent_id = ?1",
                     )?;
+                    let conv_ids: Vec<String> = stmt
+                        .query_map(params![agent_id], |row| row.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    for conv_id in &conv_ids {
+                        tx.execute(
+                            "DELETE FROM messages WHERE conversation_id = ?1",
+                            params![conv_id],
+                        )?;
+                    }
                 }
 
-                conn.execute(
+                tx.execute(
                     "DELETE FROM conversations WHERE agent_id = ?1",
                     params![agent_id],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM session_store WHERE agent_id = ?1",
                     params![agent_id],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM metrics_snapshots WHERE agent_id = ?1",
                     params![agent_id],
                 )?;
-                conn.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+                tx.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -125,18 +129,38 @@ impl StorageBackend for SqliteBackend {
     async fn load_all_agents(&self) -> Result<Vec<AgentDefinition>, StorageError> {
         self.conn
             .call(|conn| {
-                let mut stmt = conn.prepare("SELECT definition FROM agents")?;
-                let agents: Vec<AgentDefinition> = stmt
+                let mut stmt = conn.prepare("SELECT agent_id, definition FROM agents")?;
+                let rows: Vec<(String, Vec<u8>)> = stmt
                     .query_map([], |row| {
-                        let blob: Vec<u8> = row.get(0)?;
-                        Ok(blob)
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                     })?
                     .filter_map(|r| r.ok())
-                    .filter_map(|blob| {
-                        let json = compression::decompress(&blob).ok()?;
-                        serde_json::from_slice(&json).ok()
-                    })
                     .collect();
+
+                let mut agents: Vec<AgentDefinition> = Vec::with_capacity(rows.len());
+                for (agent_id, blob) in rows {
+                    let json = match compression::decompress(&blob) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            error!(
+                                agent_id = %agent_id,
+                                error = %e,
+                                "failed to decompress agent definition, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    match serde_json::from_slice::<AgentDefinition>(&json) {
+                        Ok(def) => agents.push(def),
+                        Err(e) => {
+                            error!(
+                                agent_id = %agent_id,
+                                error = %e,
+                                "failed to deserialize agent definition, skipping"
+                            );
+                        }
+                    }
+                }
                 Ok(agents)
             })
             .await
@@ -175,14 +199,16 @@ impl StorageBackend for SqliteBackend {
         let conversation_id = conversation_id.to_string();
         self.conn
             .call(move |conn| {
-                conn.execute(
+                let tx = conn.transaction()?;
+                tx.execute(
                     "DELETE FROM messages WHERE conversation_id = ?1",
                     params![conversation_id],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM conversations WHERE conversation_id = ?1",
                     params![conversation_id],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -229,7 +255,7 @@ impl StorageBackend for SqliteBackend {
 
                 // Load messages for all conversations
                 let mut msg_stmt = conn.prepare(
-                    "SELECT role, content, timestamp FROM messages
+                    "SELECT message_index, role, content, timestamp FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY message_index ASC",
                 )?;
@@ -237,22 +263,39 @@ impl StorageBackend for SqliteBackend {
                 for (conv_id, idx) in &conv_map {
                     let msg_rows = msg_stmt.query_map(params![conv_id], |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     })?;
 
                     for msg_row in msg_rows.flatten() {
-                        let (role_str, content_blob, timestamp_str) = msg_row;
+                        let (message_index, role_str, content_blob, timestamp_str) = msg_row;
                         let content_json = match compression::decompress(&content_blob) {
                             Ok(j) => j,
-                            Err(_) => continue,
+                            Err(e) => {
+                                error!(
+                                    conversation_id = %conv_id,
+                                    message_index = message_index,
+                                    error = %e,
+                                    "failed to decompress message content, skipping"
+                                );
+                                continue;
+                            }
                         };
                         let content: Vec<bridge_core::ContentBlock> =
                             match serde_json::from_slice(&content_json) {
                                 Ok(c) => c,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    error!(
+                                        conversation_id = %conv_id,
+                                        message_index = message_index,
+                                        error = %e,
+                                        "failed to deserialize message content, skipping"
+                                    );
+                                    continue;
+                                }
                             };
                         let role: bridge_core::Role =
                             serde_json::from_value(serde_json::Value::String(role_str))
@@ -294,7 +337,8 @@ impl StorageBackend for SqliteBackend {
 
         self.conn
             .call(move |conn| {
-                conn.execute(
+                let tx = conn.transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO messages
                          (conversation_id, message_index, role, content, timestamp)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -307,10 +351,11 @@ impl StorageBackend for SqliteBackend {
                     ],
                 )?;
                 let now = chrono::Utc::now().to_rfc3339();
-                conn.execute(
+                tx.execute(
                     "UPDATE conversations SET updated_at = ?1 WHERE conversation_id = ?2",
                     params![now, conversation_id],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -337,13 +382,14 @@ impl StorageBackend for SqliteBackend {
 
         self.conn
             .call(move |conn| {
-                conn.execute(
+                let tx = conn.transaction()?;
+                tx.execute(
                     "DELETE FROM messages WHERE conversation_id = ?1",
                     params![conversation_id],
                 )?;
 
                 for (idx, (role_str, content_blob, timestamp)) in prepared.into_iter().enumerate() {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO messages
                              (conversation_id, message_index, role, content, timestamp)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -358,10 +404,11 @@ impl StorageBackend for SqliteBackend {
                 }
 
                 let now = chrono::Utc::now().to_rfc3339();
-                conn.execute(
+                tx.execute(
                     "UPDATE conversations SET updated_at = ?1 WHERE conversation_id = ?2",
                     params![now, conversation_id],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;

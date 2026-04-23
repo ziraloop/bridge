@@ -359,6 +359,21 @@ HMAC-SHA256("{timestamp}.{payload}", secret)
 
 The result is **base64-encoded** (not hex). The `payload` is the raw request body (the entire JSON array).
 
+### Freshness Window
+
+To defend against replay attacks, **reject requests whose `X-Webhook-Timestamp` is outside a freshness window** before checking the HMAC. Bridge's reference implementation enforces a **5-minute window** (`MAX_TIMESTAMP_AGE_SECS = 300`):
+
+```
+if abs(now_unix - signed_timestamp) > 300:
+    reject 401
+```
+
+This is separate from the HMAC check and should be performed first: a valid signature over a stale timestamp must still be rejected.
+
+### Idempotency Key
+
+Every delivery POST carries an `X-Bridge-Idempotency-Key` header (a UUID generated per batch). The **same batch keeps the same key across all retry attempts**, so consumers can dedupe at the HTTP layer without decoding the body. This header is **not** part of the HMAC signed message, so consumers that ignore it remain compatible.
+
 ### JavaScript/Node.js
 
 ```javascript

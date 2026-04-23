@@ -35,7 +35,8 @@ pub struct EventBus {
     /// Per-conversation SSE streams.
     sse_streams: Arc<DashMap<String, mpsc::Sender<BridgeEvent>>>,
     /// Channel for webhook HTTP delivery pipeline.
-    webhook_tx: Option<mpsc::UnboundedSender<BridgeEvent>>,
+    /// Bounded to apply back-pressure / drop-on-full rather than OOM on slow consumers.
+    webhook_tx: Option<mpsc::Sender<BridgeEvent>>,
     /// Webhook URL for HTTP delivery.
     webhook_url: String,
     /// Webhook secret for HMAC signing during HTTP delivery.
@@ -47,11 +48,13 @@ pub struct EventBus {
 impl EventBus {
     /// Create a new EventBus.
     ///
-    /// - `webhook_tx`: channel for the HTTP delivery pipeline (None disables HTTP webhooks)
+    /// - `webhook_tx`: bounded channel for the HTTP delivery pipeline (None disables HTTP webhooks).
+    ///   When the channel is full, emitted events are dropped with a warn log rather than
+    ///   blocking the emitter or growing unboundedly in memory.
     /// - `storage`: optional persistence handle
     /// - `webhook_url`/`webhook_secret`: delivery config for HTTP webhooks
     pub fn new(
-        webhook_tx: Option<mpsc::UnboundedSender<BridgeEvent>>,
+        webhook_tx: Option<mpsc::Sender<BridgeEvent>>,
         storage: Option<StorageHandle>,
         webhook_url: String,
         webhook_secret: String,
@@ -98,7 +101,19 @@ impl EventBus {
 
         // 5. Queue for webhook HTTP delivery
         if let Some(ref webhook_tx) = self.webhook_tx {
-            let _ = webhook_tx.send(event);
+            if let Err(err) = webhook_tx.try_send(event) {
+                match err {
+                    mpsc::error::TrySendError::Full(dropped) => {
+                        tracing::warn!(
+                            event_id = %dropped.event_id,
+                            conversation_id = %dropped.conversation_id,
+                            sequence_number = dropped.sequence_number,
+                            "webhook channel full, dropping event"
+                        );
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {}
+                }
+            }
         }
 
         self.emitted.fetch_add(1, Ordering::Relaxed);
@@ -119,7 +134,19 @@ impl EventBus {
         }
 
         if let Some(ref webhook_tx) = self.webhook_tx {
-            let _ = webhook_tx.send(event);
+            if let Err(err) = webhook_tx.try_send(event) {
+                match err {
+                    mpsc::error::TrySendError::Full(dropped) => {
+                        tracing::warn!(
+                            event_id = %dropped.event_id,
+                            conversation_id = %dropped.conversation_id,
+                            sequence_number = dropped.sequence_number,
+                            "webhook channel full, dropping event"
+                        );
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {}
+                }
+            }
         }
 
         self.emitted.fetch_add(1, Ordering::Relaxed);
@@ -254,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_webhook_channel_receives_events() {
-        let (webhook_tx, mut webhook_rx) = mpsc::unbounded_channel();
+        let (webhook_tx, mut webhook_rx) = mpsc::channel(1024);
         let bus = EventBus::new(
             Some(webhook_tx),
             None,
@@ -276,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_all_channels_get_identical_data() {
-        let (webhook_tx, mut webhook_rx) = mpsc::unbounded_channel();
+        let (webhook_tx, mut webhook_rx) = mpsc::channel(1024);
         let bus = EventBus::new(
             Some(webhook_tx),
             None,
@@ -347,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_emit_replayed_skips_db_but_fans_out() {
-        let (webhook_tx, mut webhook_rx) = mpsc::unbounded_channel();
+        let (webhook_tx, mut webhook_rx) = mpsc::channel(1024);
         let bus = EventBus::new(Some(webhook_tx), None, String::new(), String::new());
         let mut ws_rx = bus.subscribe_ws();
 
@@ -384,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_no_secrets_on_event() {
-        let (webhook_tx, mut webhook_rx) = mpsc::unbounded_channel();
+        let (webhook_tx, mut webhook_rx) = mpsc::channel(1024);
         let bus = EventBus::new(
             Some(webhook_tx),
             None,

@@ -245,13 +245,15 @@ async fn run_server() -> anyhow::Result<()> {
     let webhook_url = config.webhook_url.clone().unwrap_or_default();
     let webhook_secret = config.control_plane_api_key.clone();
 
-    let webhook_tx = if config.webhook_url.is_some() {
+    let (webhook_tx, webhook_delivery_handle) = if config.webhook_url.is_some() {
         let webhook_config = config.webhook_config.clone().unwrap_or_default();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(
+            webhooks::delivery::PER_CONVERSATION_CHANNEL_CAPACITY,
+        );
         let client = reqwest::Client::new();
         let url = webhook_url.clone();
         let secret = webhook_secret.clone();
-        tokio::spawn(webhooks::run_delivery(
+        let handle = tokio::spawn(webhooks::run_delivery(
             rx,
             client,
             cancel.clone(),
@@ -261,9 +263,9 @@ async fn run_server() -> anyhow::Result<()> {
             storage_handle.clone(),
         ));
         info!(url = %webhook_url, "webhook delivery started");
-        Some(tx)
+        (Some(tx), Some(handle))
     } else {
-        None
+        (None, None)
     };
 
     let event_bus = Arc::new(EventBus::new(
@@ -424,6 +426,13 @@ async fn run_server() -> anyhow::Result<()> {
     info!("shutting down...");
     cancel.cancel();
     supervisor.shutdown().await;
+    if let Some(handle) = webhook_delivery_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => info!("webhook delivery drained"),
+            Ok(Err(e)) => warn!(error = %e, "webhook delivery task join failed"),
+            Err(_) => warn!("webhook delivery drain timed out after 30s"),
+        }
+    }
     if let Some(handle) = storage_handle {
         handle.drain().await;
     }
